@@ -395,6 +395,7 @@ dl.kv dt{color:var(--muted)}
 <noscript>This journal needs JavaScript to run.</noscript>
 
 <script src="config.js"></script>
+<script src="supabase-config.js"></script>
 <script>
 (() => {
 "use strict";
@@ -613,6 +614,8 @@ async function rememberedUser() {
   return u ? k : null;
 }
 function signOut() {
+  try { if (S.mode === "supabase" && SBS.session) fetch(SBCFG.url + "/auth/v1/logout", { method: "POST", keepalive: true, headers: { apikey: SBCFG.anonKey, Authorization: "Bearer " + SBS.session.access_token } }).catch(() => {}); } catch (e) {}
+  sbClear();
   try { sessionStorage.removeItem("dstj-user"); localStorage.removeItem("dstj-user"); } catch (e) {}
   location.hash = "";
   location.reload();
@@ -674,8 +677,8 @@ function profileHtml() {
   return `<div class="dialog narrow" role="dialog" aria-modal="true" aria-labelledby="dt" tabindex="-1">
     <div class="dlg-head"><h2 id="dt">Your profile</h2><button class="icon-btn" type="button" data-act="close" aria-label="Close">×</button></div>
     <div class="dlg-body">
-      <p style="margin:0">Signed in as <b>${esc(u.display)}</b></p>
-      <p class="hint" style="margin:6px 0 0">Your journal is saved on this device, under this profile.</p>${emailSectionHtml()}
+      <p style="margin:0">Signed in as <b>${esc(u.display)}</b>${u.email ? ` <span class="mut">(${esc(u.email)})</span>` : ""}</p>
+      <p class="hint" style="margin:6px 0 0">${S.mode === "supabase" ? "Your journal is saved online under this profile, so it follows you to any device." : "Your journal is saved on this device, under this profile."}</p>${emailSectionHtml()}
       <div class="sectline"><h3 style="font-size:15px;margin-bottom:10px">Change password</h3>
         <div class="fields">
           <label class="f full" for="p-cur">Current password<input id="p-cur" type="password" autocomplete="current-password"></label>
@@ -685,22 +688,30 @@ function profileHtml() {
         <div class="err-line" id="p-msg" role="alert"></div>
         <button class="btn" type="button" data-act="changepw">Change password</button></div>
       <div class="sectline"><button class="btn" type="button" data-act="signout">Sign out</button></div>
-      <details class="sectline"><summary style="cursor:pointer;color:var(--muted)">Delete this profile</summary>
+      ${S.mode === "supabase" ? `<p class="hint sectline">To delete your profile, ask the site owner.</p>` : `<details class="sectline"><summary style="cursor:pointer;color:var(--muted)">Delete this profile</summary>
         <p class="hint" style="margin:10px 0">This removes the profile and every account, trade, note and screenshot saved under it on this device. It can't be undone.</p>
         <label class="f" for="p-del">Password<input id="p-del" type="password" autocomplete="current-password"></label>
         <div class="err-line" id="p-dmsg" role="alert"></div>
-        <button class="btn danger" type="button" data-act="delprofile">Delete profile and all data</button></details>
+        <button class="btn danger" type="button" data-act="delprofile">Delete profile and all data</button></details>`}
     </div></div>`;
 }
 async function changePw() {
   const msg = $("#p-msg");
   const say = (t, ok) => { msg.className = "err-line" + (ok ? " okline" : ""); msg.textContent = t; };
   try {
-    const u = await verifyPw(S.auth.key, $("#p-cur").value);
     const n1 = $("#p-new").value, n2 = $("#p-new2").value;
-    if (n1.length < 8) throw new Error("The new password needs at least 8 characters.");
-    if (n1 !== n2) throw new Error("The new passwords don't match.");
-    await userPut({ ...u, ...(await hashPw(n1)) });
+    if (S.mode === "supabase") {
+      try { await sbSignIn(S.auth.email, $("#p-cur").value); } catch (e) { throw new Error("That password isn't right."); }
+      if (n1.length < 8) throw new Error("The new password needs at least 8 characters.");
+      if (n1 !== n2) throw new Error("The new passwords don't match.");
+      await sbFresh();
+      await sbAuth("/auth/v1/user", { password: n1 }, { method: "PUT", token: SBS.session.access_token });
+    } else {
+      const u = await verifyPw(S.auth.key, $("#p-cur").value);
+      if (n1.length < 8) throw new Error("The new password needs at least 8 characters.");
+      if (n1 !== n2) throw new Error("The new passwords don't match.");
+      await userPut({ ...u, ...(await hashPw(n1)) });
+    }
     ["p-cur", "p-new", "p-new2"].forEach(id => { $("#" + id).value = ""; });
     say("Password changed.", true);
   } catch (e) { say(e && e.message ? e.message.replace("That username or password", "That password") : "Couldn't change the password."); }
@@ -797,18 +808,247 @@ async function testEmail() {
   }
 }
 
+/* ---------- online profiles (Supabase) ---------- */
+const SBCFG = Object.assign({ url: "", anonKey: "" }, window.SUPABASE_CONFIG_USER || {});
+SBCFG.url = String(SBCFG.url || "").trim().replace(/\/+$/, "");
+SBCFG.anonKey = String(SBCFG.anonKey || "").trim();
+const sbOn = () => STANDALONE && /^https:\/\/[^\s/]+/.test(SBCFG.url) && SBCFG.anonKey.length > 20 && !/^PASTE/i.test(SBCFG.anonKey);
+const SBS = { session: null, loadedAt: 0, keep: false };
+const SB_KEY = "dstj-sb";
+function sbRead() {
+  try {
+    const s = sessionStorage.getItem(SB_KEY) || localStorage.getItem(SB_KEY);
+    SBS.keep = !!localStorage.getItem(SB_KEY);
+    return s ? JSON.parse(s) : null;
+  } catch (e) { return null; }
+}
+function sbStore(session, keep) {
+  SBS.session = session;
+  if (keep !== undefined) SBS.keep = keep;
+  try {
+    const s = JSON.stringify(session);
+    sessionStorage.setItem(SB_KEY, s);
+    if (SBS.keep) localStorage.setItem(SB_KEY, s); else localStorage.removeItem(SB_KEY);
+  } catch (e) {}
+}
+function sbClear() {
+  try { sessionStorage.removeItem(SB_KEY); localStorage.removeItem(SB_KEY); } catch (e) {}
+  SBS.session = null;
+}
+function sbMsg(j, status) {
+  const t = String((j && (j.msg || j.error_description || j.message || j.error)) || "");
+  if (/invalid login credentials/i.test(t)) return "That email or password isn't right.";
+  if (/already registered|already been registered/i.test(t)) return "That email already has a profile. Sign in instead.";
+  if (/rate limit|too many/i.test(t)) return "Too many tries. Wait a few minutes and try again.";
+  if (/not confirmed/i.test(t)) return "Please confirm your email first. Check your inbox.";
+  if (/valid email|invalid email/i.test(t)) return "That email address doesn't look right.";
+  return t || "Something went wrong (" + status + "). Try again.";
+}
+async function sbAuth(path, body, opts = {}) {
+  let r;
+  try {
+    r = await fetch(SBCFG.url + path, { method: opts.method || "POST", headers: { "Content-Type": "application/json", apikey: SBCFG.anonKey, ...(opts.token ? { Authorization: "Bearer " + opts.token } : {}) }, body: JSON.stringify(body) });
+  } catch (e) { throw new Error("Couldn't reach the online database. Check your connection."); }
+  let j = null;
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(sbMsg(j, r.status));
+  return j;
+}
+const sbToSession = j => ({ access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at || Math.floor(Date.now() / 1000) + (j.expires_in || 3600), user: j.user });
+const sbName = u => (u && u.user_metadata && u.user_metadata.username) || String((u && u.email) || "").split("@")[0] || "me";
+async function sbSignUp(username, email, pw, pw2) {
+  username = String(username || "").trim();
+  if (username.length < 2 || username.length > 30) throw new Error("Choose a username between 2 and 30 characters.");
+  if (!validEmail(email)) throw new Error("That email address doesn't look right.");
+  if (pw.length < 8) throw new Error("The password needs at least 8 characters.");
+  if (pw !== pw2) throw new Error("The two passwords don't match.");
+  const j = await sbAuth("/auth/v1/signup", { email: email.trim(), password: pw, data: { username } });
+  if (!j || !j.access_token) throw new Error("Almost there. Check your email, press the confirm link, then sign in.");
+  return sbToSession(j);
+}
+async function sbSignIn(email, pw) {
+  if (!validEmail(email)) throw new Error("Enter the email you signed up with.");
+  return sbToSession(await sbAuth("/auth/v1/token?grant_type=password", { email: email.trim(), password: pw }));
+}
+async function sbRefresh() {
+  const j = await sbAuth("/auth/v1/token?grant_type=refresh_token", { refresh_token: SBS.session.refresh_token });
+  sbStore(sbToSession(j));
+}
+async function sbFresh() {
+  if (!SBS.session) throw new Error("Not signed in.");
+  if (SBS.session.expires_at - Date.now() / 1000 < 90) await sbRefresh();
+}
+async function sbFetch(path, opts = {}) {
+  await sbFresh();
+  return fetch(SBCFG.url + path, { ...opts, headers: { apikey: SBCFG.anonKey, Authorization: "Bearer " + SBS.session.access_token, ...(opts.headers || {}) } });
+}
+async function sbUpsert(d) {
+  const r = await sbFetch("/rest/v1/kv?on_conflict=user_id,id", { method: "POST", headers: { "Content-Type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" }, body: JSON.stringify({ user_id: SBS.session.user.id, id: d.id, data: d, updated_at: new Date().toISOString() }) });
+  if (!r.ok) throw new Error(await r.text().catch(() => "HTTP " + r.status));
+}
+async function sbDelete(id) {
+  const r = await sbFetch("/rest/v1/kv?id=eq." + encodeURIComponent(id), { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  if (!r.ok) throw new Error(await r.text().catch(() => "HTTP " + r.status));
+}
+async function sbLoadAll() {
+  let all = [], from = 0;
+  const step = 1000;
+  for (;;) {
+    const r = await sbFetch("/rest/v1/kv?select=data&order=id.asc", { headers: { "Range-Unit": "items", Range: `${from}-${from + step - 1}` } });
+    if (!r.ok) throw new Error("Couldn't load your journal (" + r.status + "). " + (await r.text().catch(() => "")).slice(0, 160));
+    const rows = await r.json();
+    all = all.concat(rows.map(x => x.data));
+    if (rows.length < step) break;
+    from += step;
+  }
+  ingest(all);
+  SBS.loadedAt = Date.now();
+}
+async function setupSupabase() {
+  store.put = d => sbUpsert(d);
+  store.del = id => sbDelete(id);
+  store.putImage = async blob => {
+    const ext = /png/.test(blob.type) ? "png" : /webp/.test(blob.type) ? "webp" : "jpg";
+    const path = `${SBS.session.user.id}/${uid()}${uid()}.${ext}`;
+    const r = await sbFetch(`/storage/v1/object/shots/${path}`, { method: "POST", headers: { "Content-Type": blob.type || "image/jpeg", "x-upsert": "false" }, body: blob });
+    if (!r.ok) throw new Error(await r.text().catch(() => "HTTP " + r.status));
+    return "sb:" + path;
+  };
+  store.delImage = async ref => {
+    if (!ref || !ref.startsWith("sb:")) return;
+    await sbFetch(`/storage/v1/object/shots/${ref.slice(3)}`, { method: "DELETE" });
+  };
+  S.mode = "supabase";
+  await sbLoadAll();
+}
+async function syncNow() {
+  if (S.mode !== "supabase" || !S.ready || pendingWrites > 0 || Date.now() - SBS.loadedAt < 45000) return;
+  try { await sbLoadAll(); onData(); } catch (e) {}
+}
+function sbRecoveryFromHash() {
+  const hs = location.hash.replace(/^#/, "");
+  if (!/type=recovery/.test(hs) || !/access_token=/.test(hs)) return null;
+  const p = new URLSearchParams(hs), at = p.get("access_token");
+  if (!at) return null;
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+  return { access_token: at, refresh_token: p.get("refresh_token") || "", expires_at: Math.floor(Date.now() / 1000) + (+p.get("expires_in") || 3600) };
+}
+function sbHashError() {
+  const hs = location.hash.replace(/^#/, "");
+  if (!/error_code=/.test(hs)) return "";
+  const p = new URLSearchParams(hs);
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+  return /expired|invalid/i.test(p.get("error_description") || p.get("error_code") || "") ? "That link has expired. Enter your email to get a new one." : "";
+}
+function sbGateHtml(mode, msg) {
+  const titles = { in: "Sign in", up: "Create your profile", forgot: "Reset your password", newpass: "Choose a new password" };
+  const subs = { in: "Sign in to open your journal.", up: "Your journal is saved online under your own profile, so it follows you to any device.", forgot: "Enter your email and we'll send you a link.", newpass: "Pick a new password for your profile." };
+  const field = (id, label, type, auto, extra = "") => `<label class="f full" for="${id}">${label}<input id="${id}" type="${type}" autocomplete="${auto}" ${extra}></label>`;
+  const em = 'inputmode="email" autocapitalize="none" spellcheck="false"';
+  let f = "";
+  if (mode === "up") f = field("g-user", "Username", "text", "username", 'autocapitalize="none" spellcheck="false" maxlength="30"') + field("g-email", "Email", "text", "email", em) + field("g-pass", "Password", "password", "new-password") + field("g-pass2", "Confirm password", "password", "new-password");
+  else if (mode === "in") f = field("g-email", "Email", "text", "email", em) + field("g-pass", "Password", "password", "current-password");
+  else if (mode === "forgot") f = field("g-email", "Email", "text", "email", em);
+  else f = field("g-pass", "New password", "password", "new-password") + field("g-pass2", "Confirm new password", "password", "new-password");
+  const keep = mode === "in" || mode === "up" ? `<label class="f full chk" for="g-keep"><input id="g-keep" type="checkbox" checked> Keep me signed in on this device</label>` : "";
+  const links = mode === "in" ? `New here? <button class="linkbtn" type="button" data-gate="up">Create a profile</button> · <button class="linkbtn" type="button" data-gate="forgot">Forgot password?</button>` : mode === "up" ? `Already have a profile? <button class="linkbtn" type="button" data-gate="in">Sign in</button>` : mode === "forgot" ? `<button class="linkbtn" type="button" data-gate="in">Back to sign in</button>` : "";
+  return `<div class="gatecard" role="dialog" aria-modal="true" aria-labelledby="gt">
+    <div class="brand"><span class="b1">Dark Syndicate</span><span class="b2">Trade Journal Live</span></div>
+    <h1 id="gt" style="font-size:22px;margin-bottom:6px">${titles[mode]}</h1>
+    <p class="mut" style="margin:0 0 16px">${subs[mode]}</p>
+    <div class="fields">${f}${keep}</div>
+    <div class="err-line" id="g-err" role="alert">${esc(msg || "")}</div>
+    <button class="btn primary" id="g-go" type="button" style="width:100%">${{ in: "Sign in", up: "Create profile", forgot: "Send reset link", newpass: "Save new password" }[mode]}</button>
+    <div style="margin-top:14px;text-align:center" class="mut">${links}</div>
+  </div>`;
+}
+function runSbGate(startMode, recToken, startMsg) {
+  return new Promise(resolve => {
+    const g = $("#gate");
+    document.body.classList.add("gated");
+    g.hidden = false;
+    let mode = startMode, busy = false;
+    const draw = (m, msg) => { mode = m; g.innerHTML = sbGateHtml(m, msg); const first = g.querySelector("input"); if (first) first.focus(); };
+    const say = (t, ok) => { const e = $("#g-err", g); if (e) { e.className = "err-line" + (ok ? " okline" : ""); e.textContent = t; } };
+    const val = id => { const el = $("#" + id, g); return el ? el.value : ""; };
+    const finish = s => { g.hidden = true; g.innerHTML = ""; document.body.classList.remove("gated"); resolve(s); };
+    const go = async () => {
+      if (busy) return;
+      const btn = $("#g-go", g), label = btn.textContent;
+      busy = true; btn.disabled = true; btn.textContent = "Please wait…"; say("");
+      try {
+        if (mode === "in") { const s = await sbSignIn(val("g-email"), val("g-pass")); sbStore(s, $("#g-keep", g).checked); finish(s); }
+        else if (mode === "up") { const s = await sbSignUp(val("g-user"), val("g-email"), val("g-pass"), val("g-pass2")); sbStore(s, $("#g-keep", g).checked); finish(s); }
+        else if (mode === "forgot") {
+          if (!validEmail(val("g-email"))) throw new Error("Enter the email you signed up with.");
+          await sbAuth("/auth/v1/recover", { email: val("g-email").trim() });
+          say("If that email has a profile, a reset link is on its way. Check your inbox and your spam folder.", true);
+        } else {
+          const p1 = val("g-pass"), p2 = val("g-pass2");
+          if (p1.length < 8) throw new Error("The password needs at least 8 characters.");
+          if (p1 !== p2) throw new Error("The two passwords don't match.");
+          const u = await sbAuth("/auth/v1/user", { password: p1 }, { method: "PUT", token: recToken.access_token });
+          const s = { access_token: recToken.access_token, refresh_token: recToken.refresh_token, expires_at: recToken.expires_at, user: u };
+          sbStore(s, true); finish(s);
+        }
+      } catch (e) { say(e && e.message ? e.message : "Something went wrong. Try again."); }
+      busy = false;
+      if (btn.isConnected) { btn.disabled = false; btn.textContent = label; }
+    };
+    g.addEventListener("click", e => {
+      const t = e.target.closest("[data-gate]");
+      if (t) { draw(t.dataset.gate); return; }
+      if (e.target.closest("#g-go")) go();
+    });
+    g.addEventListener("keydown", e => {
+      if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type !== "checkbox") { e.preventDefault(); go(); }
+    });
+    draw(startMode, startMsg);
+  });
+}
+function sbFatal(msg) {
+  const g = $("#gate");
+  document.body.classList.add("gated");
+  g.hidden = false;
+  g.innerHTML = `<div class="gatecard" role="alertdialog" aria-labelledby="gt"><div class="brand"><span class="b1">Dark Syndicate</span><span class="b2">Trade Journal Live</span></div><h1 id="gt" style="font-size:22px;margin-bottom:8px">Couldn't open your journal</h1><p class="mut" style="margin:0 0 16px;overflow-wrap:anywhere">${esc(msg)}</p><button class="btn primary" id="g-retry" type="button" style="width:100%">Try again</button><div style="margin-top:12px;text-align:center"><button class="linkbtn" id="g-out" type="button">Sign out and start over</button></div></div>`;
+  $("#g-retry", g).addEventListener("click", () => location.reload());
+  $("#g-out", g).addEventListener("click", () => { sbClear(); location.reload(); });
+}
+async function startSupabase() {
+  const rec = sbRecoveryFromHash();
+  let sess = null;
+  if (rec) sess = await runSbGate("newpass", rec);
+  else {
+    const hashErr = sbHashError();
+    const stored = sbRead();
+    if (stored && stored.refresh_token && !hashErr) {
+      SBS.session = stored;
+      try { await sbFresh(); sess = SBS.session; } catch (e) { sbClear(); }
+    }
+    if (!sess) sess = await runSbGate(hashErr ? "forgot" : "in", null, hashErr);
+  }
+  SBS.session = sess;
+  const u = sess.user || {};
+  S.auth = { key: u.id, display: sbName(u), email: u.email || "" };
+  await setupSupabase();
+  return true;
+}
+
 /* ---------- storage ---------- */
 const localUrls = {};
 const store = {
   put: async () => {}, del: async () => {},
   putImage: async blob => { const id = "l:" + uid(); localUrls[id] = URL.createObjectURL(blob); return id; },
   delImage: async ref => { delete localUrls[ref]; },
-  imgSrc: ref => (!ref ? "" : ref.startsWith("l:") ? (localUrls[ref] || "") : "/_blob/" + ref)
+  imgSrc: ref => (!ref ? "" : ref.startsWith("sb:") ? SBCFG.url + "/storage/v1/object/public/shots/" + ref.slice(3) : ref.startsWith("l:") ? (localUrls[ref] || "") : "/_blob/" + ref)
 };
 const queues = new Map();
+let pendingWrites = 0;
 const enqueue = (key, fn) => {
+  pendingWrites++;
   const p = (queues.get(key) || Promise.resolve()).catch(() => {}).then(fn);
   queues.set(key, p);
+  p.catch(() => {}).then(() => { pendingWrites--; });
   return p;
 };
 const persist = d => enqueue(d.id, () => store.put(d)).catch(() => toast("That change couldn't be saved. Check your connection and try again.", true));
@@ -983,9 +1223,13 @@ function rulesFor(a, D) {
     const tgt = r2(start * a.profitTarget / 100), net = D.stats.net, done = net >= tgt;
     rows.push({ key: "target", short: "Profit target", title: `Profit target ${pctTxt(a.profitTarget)} · ${money(tgt)}`, pill: done ? ["win", "Reached"] : ["warn", "In progress"], pct: Math.max(0, Math.min(1, net / tgt)), tone: "", left: `Made: ${money(Math.max(net, 0))}`, right: done ? "Target hit" : `Remaining: ${money(tgt - net)}` });
   }
+  const need = a.minDayProfitPct && start ? r2(start * a.minDayProfitPct / 100) : null;
+  const counted = need == null ? D.stats.days : D.dates.filter(d => D.byDay[d].pnl >= need).length;
   if (a.minDays) {
-    const n = D.stats.days, done = n >= a.minDays;
-    rows.push({ key: "days", short: "Minimum days", title: `Minimum trading days · ${a.minDays}`, pill: done ? ["win", "Done"] : ["warn", "In progress"], pct: Math.min(1, n / a.minDays), tone: "", left: `${plural(n, "day")} traded`, right: done ? "Requirement met" : `${plural(a.minDays - n, "day")} to go` });
+    const n = counted, done = n >= a.minDays;
+    rows.push({ key: "days", short: "Minimum days", title: `Minimum trading days · ${a.minDays}${need != null ? ` · each needs ${money(need)}` : ""}`, pill: done ? ["win", "Done"] : ["warn", "In progress"], pct: Math.min(1, n / a.minDays), tone: "", left: need != null ? `${plural(n, "day")} counted of ${D.stats.days} traded` : `${plural(n, "day")} traded`, right: done ? "Requirement met" : `${plural(a.minDays - n, "day")} to go`, note: need != null ? `A day only counts if it makes at least ${pctTxt(a.minDayProfitPct)} (${money(need)}).` : "" });
+  } else if (need != null) {
+    rows.push({ key: "mdp", short: "Qualifying days", title: `Days that made at least ${pctTxt(a.minDayProfitPct)} · ${money(need)}`, pill: ["be", plural(counted, "day")], pct: D.stats.days ? counted / D.stats.days : 0, tone: "", left: `${counted} of ${D.stats.days} traded days`, right: "" });
   }
   if (a.maxDD && start) {
     const lim = r2(start * a.maxDD / 100), trailing = a.ddType === "trailing";
@@ -1208,12 +1452,13 @@ function pageCalendar(D) {
   const monthPnl = r2(inMonth.reduce((a, d) => a + D.byDay[d].pnl, 0));
   const monthTrades = inMonth.reduce((a, d) => a + D.byDay[d].trades.length, 0);
   const today = todayStr();
+  const needDay = D.acct.minDayProfitPct && D.acct.startBalance ? r2(D.acct.startBalance * D.acct.minDayProfitPct / 100) : null;
   const dows = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(d => `<div class="dow">${d}</div>`).join("") + `<div class="dow">Total</div>`;
   const rows = weeks.map((w, wi) => {
     const cells = w.map(d => {
       const dd = D.byDay[d], inM = d.slice(0, 7) === S.month, n = +d.slice(8);
       const base = `${inM ? "" : " out"}${d === today ? " today" : ""}`;
-      if (dd) return `<a class="cell has ${cls(dd.pnl)}${base}" href="#/day/${d}" aria-label="${esc(longDate(d))}: ${money(dd.pnl, true)}, ${plural(dd.trades.length, "trade")}"><span class="dn">${n}</span><span class="cv num">${moneyTrim(dd.pnl, true)}</span><span class="cn">${plural(dd.trades.length, "trade")}</span></a>`;
+      if (dd) return `<a class="cell has ${cls(dd.pnl)}${base}" href="#/day/${d}" aria-label="${esc(longDate(d))}: ${money(dd.pnl, true)}, ${plural(dd.trades.length, "trade")}"><span class="dn">${n}</span><span class="cv num">${moneyTrim(dd.pnl, true)}</span><span class="cn">${plural(dd.trades.length, "trade")}${needDay != null && dd.pnl >= needDay ? " ✓" : ""}</span></a>`;
       return `<div class="cell${base}"><span class="dn">${n}</span></div>`;
     }).join("");
     const wk = D.byWeek[w[0]];
@@ -1221,7 +1466,7 @@ function pageCalendar(D) {
     return cells + tot;
   }).join("");
   const nav = `<div class="monthnav"><button class="btn ghost" type="button" data-act="monthprev" aria-label="Previous month">‹</button><h2>${esc(monthName(S.month))}</h2><button class="btn ghost" type="button" data-act="monthnext" aria-label="Next month">›</button><button class="btn ghost" type="button" data-act="monthtoday">Today</button></div>`;
-  return `<div class="page-head"><div><h1>Calendar</h1><div class="sub">${esc(acctLabel(D.acct))} · Monthly P&amp;L: <span class="num ${cls(monthPnl)}">${money(monthPnl, true)}</span> · ${plural(monthTrades, "trade")}</div></div><div class="actions">${nav}${addBtn()}</div></div><div class="cal" role="group" aria-label="Calendar">${dows}${rows}</div>`;
+  return `<div class="page-head"><div><h1>Calendar</h1><div class="sub">${esc(acctLabel(D.acct))} · Monthly P&amp;L: <span class="num ${cls(monthPnl)}">${money(monthPnl, true)}</span> · ${plural(monthTrades, "trade")}</div></div><div class="actions">${nav}${addBtn()}</div></div><div class="cal" role="group" aria-label="Calendar">${dows}${rows}</div>${needDay != null ? `<div class="hint" style="margin-top:10px">✓ marks a day that counts as a trading day (it made at least ${pctTxt(D.acct.minDayProfitPct)}, ${money(needDay)}).</div>` : ""}`;
 }
 
 const thumb = (t, c = "thumb") => t.img && store.imgSrc(t.img) ? `<img class="${c}" src="${esc(store.imgSrc(t.img))}" alt="" loading="lazy">` : `<span class="${c} none">no image</span>`;
@@ -1268,6 +1513,7 @@ function pageDay(D) {
     <div>Pairs</div><div class="chips">${pairs.map(p => `<span class="chip">${esc(p)}</span>`).join("")}</div>
     <div>Daily result</div><div><select data-day="result" aria-label="Daily result" data-keep><option value="">Auto (${res === "BE" ? "Break-even" : res})</option><option value="Win"${info.result === "Win" ? " selected" : ""}>Win</option><option value="Loss"${info.result === "Loss" ? " selected" : ""}>Loss</option><option value="BE"${info.result === "BE" ? " selected" : ""}>Break-even</option></select>&nbsp;<span class="pill ${resClass(res)}">${res === "BE" ? "Break-even" : res}</span></div>
     <div>Daily P&amp;L</div><div class="num ${cls(dd.pnl)}"><b>${money(dd.pnl, true)}</b>&nbsp;<span style="color:var(--muted)">from ${plural(dd.trades.length, "trade")}</span></div>
+    ${D.acct.minDayProfitPct && D.acct.startBalance ? (() => { const need = r2(D.acct.startBalance * D.acct.minDayProfitPct / 100), ok = dd.pnl >= need; return `<div>Counts as a trading day</div><div><span class="pill ${ok ? "win" : "loss"}">${ok ? "Yes" : "No"}</span>&nbsp;<span style="color:var(--muted)">needs ${money(need)} (${pctTxt(D.acct.minDayProfitPct)})</span></div>`; })() : ""}
     <div>Weekly P&amp;L</div><div class="num ${cls(wk.pnl)}"><b>${money(wk.pnl, true)}</b>&nbsp;<span style="color:var(--muted)">${esc(shortDate(wk.start))} – ${esc(shortDate(addDays(wk.start, 6)))}</span></div>
     <div>Starting balance</div><div class="num">${money(dd.startBal)}</div>
     <div>Balance after</div><div class="num">${money(dd.endBal)}</div>
@@ -1703,6 +1949,7 @@ function acctHtml() {
       <label class="f full" for="a-ddt">Max drawdown is measured<select id="a-ddt"><option value="static"${trailing ? "" : " selected"}>From the starting balance (static)</option><option value="trailing"${trailing ? " selected" : ""}>From your highest balance (trailing)</option></select></label>
       <label class="f" for="a-tgt">Profit target (%) <span class="hint">optional</span><input id="a-tgt" type="text" inputmode="decimal" autocomplete="off" value="${v("profitTarget")}" placeholder="10"></label>
       <label class="f" for="a-mind">Minimum trading days <span class="hint">optional</span><input id="a-mind" type="text" inputmode="numeric" autocomplete="off" value="${v("minDays")}" placeholder="4"></label>
+      <label class="f full" for="a-mdp">A day only counts as a trading day if it makes at least this % of the account size <span class="hint">optional</span><input id="a-mdp" type="text" inputmode="decimal" autocomplete="off" value="${v("minDayProfitPct")}" placeholder="0.5"></label>
       <label class="f" for="a-lots">Max lot size <span class="hint">optional</span><input id="a-lots" type="text" inputmode="decimal" autocomplete="off" value="${v("maxLots")}" placeholder="2"></label>
       <label class="f" for="a-tl">Max loss per trade (%) <span class="hint">optional</span><input id="a-tl" type="text" inputmode="decimal" autocomplete="off" value="${v("maxLossPct")}" placeholder="2"></label>
       <label class="f full" for="a-cons">Consistency rule: best day can be at most this % of total profit <span class="hint">optional</span><input id="a-cons" type="text" inputmode="decimal" autocomplete="off" value="${v("consistencyPct")}" placeholder="30"></label>
@@ -1726,6 +1973,8 @@ function updAcctPrev() {
   if (size > 0 && dy > 0) parts.push(`Daily drawdown ${money(size * dy / 100)}`);
   if (size > 0 && tg > 0) parts.push(`Profit target ${money(size * tg / 100)}`);
   if (size > 0 && tl > 0) parts.push(`Max loss per trade ${money(size * tl / 100)}`);
+  const md = num($("#a-mdp").value);
+  if (size > 0 && md > 0) parts.push(`A day counts at ${money(size * md / 100)}`);
   el.textContent = parts.length ? parts.join(" · ") : "Percentages are worked out from the account size.";
 }
 function pctField(id, label, max = 100) {
@@ -1742,6 +1991,7 @@ Extract the rules a trading journal can track. Reply with only a JSON object wit
 - drawdownType: "static" if the limit is measured from the initial balance, "trailing" if it trails the highest balance or equity
 - profitTargetPct: the profit target as a percent of account size
 - minTradingDays: the minimum number of trading days as an integer
+- minDayProfitPct: the minimum profit a day must make, as a percent of account size, for that day to count as a trading day (for example 0.5)
 - maxLots: the maximum lot size allowed per trade as a number
 - maxLossPerTradePct: the maximum loss allowed on one trade as a percent of account size
 - consistencyPct: for a consistency rule, the largest percent of total profit that the best single day may be (for example 30)
@@ -1766,6 +2016,7 @@ async function readRules() {
     put("a-day", r.dailyDrawdownPct, x => x > 0 && x <= 100);
     put("a-tgt", r.profitTargetPct, x => x > 0 && x <= 1000);
     put("a-mind", r.minTradingDays, x => x >= 1 && x <= 365);
+    put("a-mdp", r.minDayProfitPct, x => x > 0 && x <= 100);
     put("a-lots", r.maxLots, x => x > 0);
     put("a-tl", r.maxLossPerTradePct, x => x > 0 && x <= 100);
     put("a-cons", r.consistencyPct, x => x > 0 && x <= 100);
@@ -1789,15 +2040,15 @@ function saveAcct() {
   const name = v("a-name"), size = num(v("a-size"));
   if (!name) { err.textContent = "Give the account a name."; $("#a-name").focus(); return; }
   if (size == null || size <= 0) { err.textContent = "Enter the account size, for example 10000."; $("#a-size").focus(); return; }
-  const mx = pctField("a-max", "Max drawdown"), dy = pctField("a-day", "Daily drawdown"), tg = pctField("a-tgt", "Profit target", 1000), tl = pctField("a-tl", "Max loss per trade"), cs = pctField("a-cons", "Consistency rule");
-  const bad = mx.err || dy.err || tg.err || tl.err || cs.err;
+  const mx = pctField("a-max", "Max drawdown"), dy = pctField("a-day", "Daily drawdown"), tg = pctField("a-tgt", "Profit target", 1000), tl = pctField("a-tl", "Max loss per trade"), cs = pctField("a-cons", "Consistency rule"), md = pctField("a-mdp", "Minimum daily profit");
+  const bad = mx.err || dy.err || tg.err || tl.err || cs.err || md.err;
   if (bad) { err.textContent = bad; return; }
   let minDays = null, lots = null;
   if (v("a-mind") !== "") { const n = num(v("a-mind")); if (n == null || n < 1 || n > 365) { err.textContent = "Minimum trading days should be a whole number."; return; } minDays = Math.round(n); }
   if (v("a-lots") !== "") { const n = num(v("a-lots")); if (n == null || n <= 0) { err.textContent = "Max lot size should be a number above 0."; return; } lots = n; }
   const prev = S.modal.edit ? acctOf(S.modal.edit) : null;
   const other = S.modal.otherRules !== undefined ? S.modal.otherRules : (prev && prev.otherRules) || [];
-  const a = { ...(prev || { id: "acc_" + uid(), createdAt: Date.now() }), kind: "account", name, platform: v("a-plat"), type: v("a-kind"), startBalance: size, maxDD: mx.v, dailyDD: dy.v, ddType: $("#a-ddt").value, profitTarget: tg.v, minDays, maxLots: lots, maxLossPct: tl.v, consistencyPct: cs.v, noWeekend: $("#a-wknd").checked, rulesText: v("a-rules"), otherRules: other };
+  const a = { ...(prev || { id: "acc_" + uid(), createdAt: Date.now() }), kind: "account", name, platform: v("a-plat"), type: v("a-kind"), startBalance: size, maxDD: mx.v, dailyDD: dy.v, ddType: $("#a-ddt").value, profitTarget: tg.v, minDays, maxLots: lots, maxLossPct: tl.v, consistencyPct: cs.v, minDayProfitPct: md.v, noWeekend: $("#a-wknd").checked, rulesText: v("a-rules"), otherRules: other };
   const i = S.accounts.findIndex(x => x.id === a.id);
   if (i >= 0) S.accounts[i] = a; else S.accounts.push(a);
   persist({ ...a });
@@ -2281,7 +2532,7 @@ document.addEventListener("input", e => {
   const t = e.target;
   if (t.tagName === "TEXTAREA" && t.dataset && t.dataset.day && S.route.name === "day") setDayField(S.route.date, t.dataset.day, t.value);
   if (t.dataset && t.dataset.newsfield === "text") S.newsDraft.text = t.value;
-  if (t.id && /^a-(size|max|day|tgt|tl)$/.test(t.id)) updAcctPrev();
+  if (t.id && /^a-(size|max|day|tgt|tl|mdp)$/.test(t.id)) updAcctPrev();
 });
 document.addEventListener("focusout", e => {
   const t = e.target;
@@ -2321,6 +2572,10 @@ async function init() {
   }
   let ok = false;
   try { ok = await setupCloud(); } catch (e) { ok = false; }
+  if (!ok && STANDALONE && sbOn()) {
+    try { ok = await startSupabase(); }
+    catch (e) { sbFatal(e && e.message ? e.message : "Something went wrong while opening your journal."); return; }
+  }
   if (!ok) {
     const standalone = !(window.claude && typeof window.claude.use === "function");
     if (standalone && authOk()) {
@@ -2340,7 +2595,7 @@ async function init() {
   }
   migrate();
   if (S.auth) {
-    const u = await userGet(S.auth.key).catch(() => null);
+    const u = S.mode === "supabase" ? { email: S.auth.email } : await userGet(S.auth.key).catch(() => null);
     if (u && u.email && !S.settings.email) { S.settings.email = u.email; saveSettings(); }
   }
   S.newsDraft.tz = S.settings.newsTz || "local";
@@ -2349,6 +2604,8 @@ async function init() {
   render();
   checkAlerts();
   if (STANDALONE && S.settings.ffAuto) loadFF({ silent: true });
+  window.addEventListener("focus", syncNow);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) syncNow(); });
   setInterval(tick, 1000);
 }
 init();
