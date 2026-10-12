@@ -2,5 +2,5 @@
 window.EMAIL_CONFIG_USER = {
   serviceId: "service_bhjlt35",
   templateId: "template_4emrhqj",
-  publicKey: "PASTE_YOUR_PUBLIC_KEY_HERE"
+  publicKey: "RoQQfBkIOi090iOEQ"
 };
